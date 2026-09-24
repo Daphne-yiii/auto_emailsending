@@ -1,0 +1,14 @@
+# Python cache and virtual environments
+__pycache__/
+*.py[cod]
+.venv/
+
+# macOS metadata
+.DS_Store
+
+# Generated data and cached source documents
+output/
+
+# Contact data exports
+multi_agent_arxiv_talent_pool_chinese.csv
+multi_agent_arxiv_talent_pool_chinese_邮件版.csv
