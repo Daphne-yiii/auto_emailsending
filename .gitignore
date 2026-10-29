@@ -2,6 +2,11 @@
 __pycache__/
 *.py[cod]
 .venv/
+.env
+
+# Local app and deployment secrets
+.streamlit/secrets.toml
+.claude/
 
 # macOS metadata
 .DS_Store

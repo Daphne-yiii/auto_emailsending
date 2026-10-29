@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import base64
+import hmac
 import html
 import io
 import json
@@ -11,6 +12,7 @@ import os
 import re
 import shutil
 import smtplib
+import ssl
 import subprocess
 import uuid
 from datetime import datetime
@@ -19,6 +21,7 @@ from pathlib import Path
 
 import pandas as pd
 import streamlit as st
+from streamlit.errors import StreamlitSecretNotFoundError
 
 from generate_emails_from_csv import (
     ABSTRACT_COL,
@@ -42,10 +45,67 @@ STATUS_COL = "发送状态"
 ERROR_COL = "发送错误"
 SENT_AT_COL = "发送时间"
 MESSAGE_ID_COL = "消息ID"
+MAX_UPLOAD_BYTES = 25 * 1024 * 1024
+MAX_ROWS = 5000
+MAX_SUBJECT_LENGTH = 500
+MAX_BODY_LENGTH = 500_000
+MAX_INLINE_IMAGE_BYTES = 5 * 1024 * 1024
 
 st.set_page_config(page_title="人物邮件审核工作台", page_icon="✉", layout="wide")
 
+
+def get_config(name: str, default: str = "") -> str:
+    try:
+        if name in st.secrets:
+            value = st.secrets[name]
+            return str(value).strip()
+    except (StreamlitSecretNotFoundError, FileNotFoundError, KeyError):
+        pass
+    return os.getenv(name, default).strip()
+
+
+def get_bool_config(name: str, default: bool = False) -> bool:
+    raw = get_config(name, "true" if default else "false").lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def configure_runtime_secrets() -> None:
+    for name in ("OPENAI_API_KEY", "OPENAI_MODEL", "OPENAI_BASE_URL"):
+        value = get_config(name)
+        if value:
+            os.environ[name] = value
+
+
+def require_login() -> None:
+    expected = get_config("APP_PASSWORD")
+    if not expected:
+        st.error("网站管理员尚未配置 APP_PASSWORD，工作台已锁定。")
+        st.caption("请在 Streamlit Cloud 的 App settings → Secrets 中配置访问密码。")
+        st.stop()
+    if st.session_state.get("authenticated"):
+        return
+    st.title("人物邮件审核工作台")
+    st.caption("请输入管理员访问密码。")
+    with st.form("login_form", clear_on_submit=True):
+        password = st.text_input("访问密码", type="password")
+        submitted = st.form_submit_button("登录", type="primary")
+    if submitted:
+        if hmac.compare_digest(password, expected):
+            st.session_state.authenticated = True
+            st.rerun()
+        st.error("访问密码错误。")
+    st.stop()
+
+
+configure_runtime_secrets()
+require_login()
+
 LARK_CLI_PATH = shutil.which("lark-cli") or os.path.expanduser("~/.nvm/versions/node/v25.9.0/bin/lark-cli")
+LARK_CLI_ENV = {
+    **os.environ,
+    "LARKSUITE_CLI_NO_UPDATE_NOTIFIER": "1",
+    "LARKSUITE_CLI_NO_SKILLS_NOTIFIER": "1",
+}
 
 RICH_EDITOR_HTML = """
 <div class="mail-editor">
@@ -296,9 +356,17 @@ def body_to_editor_html(value: object) -> str:
 
 def read_table(uploaded_file) -> pd.DataFrame:
     data = uploaded_file.getvalue()
-    if uploaded_file.name.lower().endswith((".xlsx", ".xls")):
-        return pd.read_excel(io.BytesIO(data))
-    return pd.read_csv(io.BytesIO(data), encoding="utf-8-sig")
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise ValueError("上传文件不能超过 25 MB")
+    if uploaded_file.name.lower().endswith(".xlsx"):
+        dataframe = pd.read_excel(io.BytesIO(data))
+    elif uploaded_file.name.lower().endswith(".csv"):
+        dataframe = pd.read_csv(io.BytesIO(data), encoding="utf-8-sig")
+    else:
+        raise ValueError("仅支持 CSV 或 XLSX 文件")
+    if len(dataframe) > MAX_ROWS:
+        raise ValueError(f"单次最多处理 {MAX_ROWS} 条记录")
+    return dataframe
 
 
 def find_email_column(dataframe: pd.DataFrame) -> str | None:
@@ -416,16 +484,69 @@ def extract_inline_image(html_body: str, work_dir: Path) -> tuple[str, list[dict
         other_attrs = match.group(3)
         if len(inline_images) >= 1:
             return ""
+        try:
+            image_data = base64.b64decode(b64_data, validate=True)
+        except ValueError as exc:
+            raise ValueError("内嵌图片数据无效") from exc
+        if len(image_data) > MAX_INLINE_IMAGE_BYTES:
+            raise ValueError("内嵌图片不能超过 5 MB")
         cid = uuid.uuid4().hex
         ext = img_format if img_format in ("png", "jpg", "jpeg", "gif") else "png"
         file_name = f"inline_{cid}.{ext}"
         file_path = work_dir / file_name
-        file_path.write_bytes(base64.b64decode(b64_data))
+        file_path.write_bytes(image_data)
         inline_images.append({"cid": cid, "file_path": str(file_path.relative_to(work_dir))})
         return f'<img src="cid:{cid}"{other_attrs}>'
 
     html_replaced = re.sub(pattern, replace_with_cid, html_body)
     return html_replaced, inline_images
+
+
+def get_feishu_sender_address() -> tuple[str, str]:
+    cmd = [
+        LARK_CLI_PATH,
+        "mail",
+        "user_mailboxes",
+        "profile",
+        "--params",
+        '{"user_mailbox_id":"me"}',
+        "--as",
+        "user",
+    ]
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=20,
+            env=LARK_CLI_ENV,
+        )
+    except subprocess.TimeoutExpired:
+        return "", "读取飞书发件邮箱超时"
+    if result.returncode != 0:
+        return "", format_lark_cli_error(result.stderr or result.stdout)
+    try:
+        payload = json.loads(result.stdout)
+        address = clean_text(payload.get("data", {}).get("primary_email_address", ""))
+    except json.JSONDecodeError:
+        address = ""
+    if not address:
+        return "", "未能读取当前飞书账号的主邮箱地址，请重新授权邮箱权限"
+    return address, ""
+
+
+def format_lark_cli_error(raw: str) -> str:
+    text = clean_text(raw)
+    try:
+        payload = json.loads(raw)
+        error = payload.get("error", {})
+        message = clean_text(error.get("message", ""))
+        hint = clean_text(error.get("hint", ""))
+        if message:
+            return f"{message}{f'；{hint}' if hint else ''}"
+    except json.JSONDecodeError:
+        pass
+    return text or "飞书 CLI 调用失败"
 
 
 def send_via_feishu_cli(row: pd.Series, html_body: str | None = None) -> tuple[bool, str, str]:
@@ -451,6 +572,10 @@ def send_via_feishu_cli(row: pd.Series, html_body: str | None = None) -> tuple[b
     if not body:
         return False, "邮件正文为空，请先生成或填写正文", ""
 
+    sender_address, sender_error = get_feishu_sender_address()
+    if sender_error:
+        return False, sender_error, ""
+
     work_dir = Path("/tmp") / f"feishu_mail_{uuid.uuid4().hex[:8]}"
     work_dir.mkdir(parents=True, exist_ok=True)
 
@@ -465,6 +590,8 @@ def send_via_feishu_cli(row: pd.Series, html_body: str | None = None) -> tuple[b
             "user",
             "--confirm-send",
             "--json",
+            "--from",
+            sender_address,
             "--to",
             recipient,
             "--subject",
@@ -485,9 +612,10 @@ def send_via_feishu_cli(row: pd.Series, html_body: str | None = None) -> tuple[b
             text=True,
             timeout=30,
             cwd=str(work_dir),
+            env=LARK_CLI_ENV,
         )
         if result.returncode != 0:
-            return False, f"CLI 错误: {result.stderr or result.stdout}", ""
+            return False, format_lark_cli_error(result.stderr or result.stdout), ""
         output = result.stdout.strip()
         message_id = ""
         try:
@@ -508,19 +636,96 @@ def send_via_feishu_cli(row: pd.Series, html_body: str | None = None) -> tuple[b
             shutil.rmtree(work_dir, ignore_errors=True)
 
 
-def smtp_send(row: pd.Series, smtp_host: str, smtp_port: int, smtp_user: str, smtp_password: str, sender_name: str) -> None:
+def html_to_plain_text(value: str) -> str:
+    text = re.sub(r"<\s*br\s*/?>", "\n", value, flags=re.IGNORECASE)
+    text = re.sub(r"</\s*(p|div|li|h[1-6]|blockquote)\s*>", "\n", text, flags=re.IGNORECASE)
+    text = re.sub(r"<[^>]+>", "", text)
+    return html.unescape(text).strip()
+
+
+def sanitize_smtp_error(error: Exception) -> str:
+    if isinstance(error, smtplib.SMTPAuthenticationError):
+        return "SMTP 认证失败，请检查发件邮箱和授权码"
+    if isinstance(error, (TimeoutError, smtplib.SMTPServerDisconnected)):
+        return "SMTP 服务器连接超时或已断开"
+    if isinstance(error, smtplib.SMTPRecipientsRefused):
+        return "SMTP 服务器拒绝了收件人地址"
+    if isinstance(error, smtplib.SMTPSenderRefused):
+        return "SMTP 服务器拒绝了发件人地址"
+    if isinstance(error, ssl.SSLError):
+        return "SMTP TLS 安全连接失败，请检查主机、端口和加密方式"
+    return f"SMTP 发送失败：{type(error).__name__}"
+
+
+def smtp_send(
+    row: pd.Series,
+    smtp_host: str,
+    smtp_port: int,
+    smtp_user: str,
+    smtp_password: str,
+    sender_name: str,
+    html_body: str | None = None,
+    use_ssl: bool = False,
+) -> None:
     recipient = clean_text(row.get(EMAIL_COL, ""))
+    subject = clean_text(row.get(SUBJECT_COL, ""))
+    body = clean_text(html_body if html_body is not None else row.get(EMAIL_BODY_COL, ""))
     if not recipient or "@" not in recipient:
         raise ValueError("邮箱为空或格式无效")
+    if not subject:
+        raise ValueError("邮件主题为空")
+    if len(subject) > MAX_SUBJECT_LENGTH:
+        raise ValueError(f"邮件主题不能超过 {MAX_SUBJECT_LENGTH} 个字符")
+    if not body:
+        raise ValueError("邮件正文为空")
+    if len(body) > MAX_BODY_LENGTH:
+        raise ValueError("邮件正文过长")
+    if not smtp_host or not smtp_user or not smtp_password:
+        raise ValueError("SMTP 配置不完整，请检查主机、发件邮箱和授权码")
+
     message = EmailMessage()
     message["From"] = f"{sender_name} <{smtp_user}>" if sender_name else smtp_user
     message["To"] = recipient
-    message["Subject"] = clean_text(row.get(SUBJECT_COL, ""))
-    message.set_content(str(row.get(EMAIL_BODY_COL, "")))
-    with smtplib.SMTP(smtp_host, smtp_port, timeout=30) as server:
-        server.starttls()
-        server.login(smtp_user, smtp_password)
-        server.send_message(message)
+    message["Subject"] = subject
+    work_dir = Path("/tmp") / f"smtp_mail_{uuid.uuid4().hex[:8]}"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        if re.search(r"<\s*[a-z][^>]*>", body, re.IGNORECASE):
+            html_body_with_cids, inline_images = extract_inline_image(body, work_dir)
+            message.set_content(html_to_plain_text(html_body_with_cids))
+            message.add_alternative(html_body_with_cids, subtype="html")
+            html_part = message.get_body(preferencelist=("html",))
+            for image in inline_images:
+                image_path = work_dir / image["file_path"]
+                suffix = image_path.suffix.lower().lstrip(".")
+                subtype = "jpeg" if suffix in {"jpg", "jpeg"} else suffix
+                html_part.add_related(
+                    image_path.read_bytes(),
+                    maintype="image",
+                    subtype=subtype,
+                    cid=f"<{image['cid']}>",
+                    filename=image_path.name,
+                )
+        else:
+            message.set_content(body)
+
+        context = ssl.create_default_context()
+        try:
+            if use_ssl or smtp_port == 465:
+                with smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=30, context=context) as server:
+                    server.login(smtp_user, smtp_password)
+                    server.send_message(message)
+            else:
+                with smtplib.SMTP(smtp_host, smtp_port, timeout=30) as server:
+                    server.ehlo()
+                    server.starttls(context=context)
+                    server.ehlo()
+                    server.login(smtp_user, smtp_password)
+                    server.send_message(message)
+        except (OSError, smtplib.SMTPException, ssl.SSLError) as exc:
+            raise RuntimeError(sanitize_smtp_error(exc)) from exc
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
 
 
 def export_bytes(dataframe: pd.DataFrame, file_type: str) -> bytes:
@@ -536,9 +741,13 @@ st.title("人物邮件审核工作台")
 st.caption("从表格读取已有邮箱，自动生成邮件草稿；只有审核通过并确认后才会发送。")
 
 with st.sidebar:
+    if st.button("退出登录", use_container_width=True):
+        for key in list(st.session_state):
+            del st.session_state[key]
+        st.rerun()
     st.header("1. 导入与生成")
-    uploaded = st.file_uploader("上传 CSV 或 Excel", type=["csv", "xlsx", "xls"])
-    model = st.text_input("生成模型", value=os.getenv("OPENAI_MODEL", DEFAULT_MODEL))
+    uploaded = st.file_uploader("上传 CSV 或 Excel", type=["csv", "xlsx"])
+    model = st.text_input("生成模型", value=get_config("OPENAI_MODEL", DEFAULT_MODEL))
     if uploaded is not None and st.button("加载表格", type="primary"):
         try:
             table = ensure_email_column(prepare_table(read_table(uploaded)))
@@ -565,17 +774,21 @@ with st.sidebar:
                     st.error(str(exc))
 
     st.header("2. 发送配置")
-    send_method = st.radio("发送方式", ["飞书邮箱 CLI（已授权）", "SMTP"], index=0, key="send_method")
-
-    if send_method == "SMTP":
-        smtp_host = st.text_input("SMTP 主机", value=os.getenv("SMTP_HOST", "smtp.feishu.cn"))
-        smtp_port = st.number_input("SMTP 端口", min_value=1, max_value=65535, value=int(os.getenv("SMTP_PORT", "465")))
-        smtp_user = st.text_input("发件邮箱", value=os.getenv("SMTP_USER", ""))
-        smtp_password = st.text_input("SMTP 密码/授权码", value=os.getenv("SMTP_PASSWORD", ""), type="password")
-        sender_name = st.text_input("发件人名称", value=os.getenv("SMTP_SENDER_NAME", ""))
-        use_ssl = st.checkbox("使用 SSL（465 端口）", value=smtp_port == 465)
+    smtp_host = get_config("SMTP_HOST", "smtp.feishu.cn")
+    smtp_port_text = get_config("SMTP_PORT", "465")
+    try:
+        smtp_port = int(smtp_port_text)
+    except ValueError:
+        smtp_port = 465
+    smtp_user = get_config("SMTP_USER")
+    smtp_password = get_config("SMTP_PASSWORD")
+    sender_name = get_config("SMTP_SENDER_NAME")
+    use_ssl = get_bool_config("SMTP_USE_SSL", smtp_port == 465)
+    st.caption(f"SMTP：{smtp_host}:{smtp_port} · 发件邮箱：{smtp_user or '未配置'}")
+    if smtp_password:
+        st.success("SMTP 授权码已通过 Secrets 配置。")
     else:
-        smtp_host = smtp_port = smtp_user = smtp_password = sender_name = use_ssl = None
+        st.warning("SMTP 授权码未配置；可生成和审核草稿，但暂时不能发送。")
 
 if "table" not in st.session_state:
     st.info("请先在左侧上传 CSV 或 Excel 文件。")
@@ -663,59 +876,62 @@ if "preview_index" in st.session_state and st.session_state.preview_index in tab
 
     st.caption("💡 可直接将图片拖入正文区域，图片会自动插入并选中；点击图片后也可拖拽 8 个控制点等比例调整大小。")
 
+    already_sent = clean_text(row.get(STATUS_COL, "")) == "已发送"
+    confirmed = st.checkbox(
+        "我已核对收件人、主题和正文，并确认发送此邮件",
+        key=f"confirm_send_{preview_idx}",
+        disabled=already_sent,
+    )
+    if already_sent:
+        st.warning("这条记录已标记为已发送。为避免重复投递，当前会话中不能再次发送。")
+
     col_send, col_close = st.columns([1, 1])
 
     with col_send:
-        if st.button("✉️ 发送此邮件", type="primary", key=f"send_{preview_idx}"):
-            # 校验
+        if st.button(
+            "✉️ 发送此邮件",
+            type="primary",
+            key=f"send_{preview_idx}",
+            disabled=already_sent or not confirmed or not smtp_password,
+        ):
             if not preview_email or "@" not in preview_email:
                 st.error("收件人邮箱无效")
             elif not preview_subject.strip():
                 st.error("主题不能为空")
+            elif len(preview_subject) > MAX_SUBJECT_LENGTH:
+                st.error(f"主题不能超过 {MAX_SUBJECT_LENGTH} 个字符")
             elif not preview_body_html or not preview_body_html.strip():
                 st.error("正文不能为空")
+            elif len(preview_body_html) > MAX_BODY_LENGTH:
+                st.error("正文过长")
             else:
-                # 同步编辑值回表格
                 st.session_state.table.at[preview_idx, EMAIL_COL] = preview_email
                 st.session_state.table.at[preview_idx, SUBJECT_COL] = preview_subject
                 st.session_state.table.at[preview_idx, EMAIL_BODY_COL] = preview_body_html
-
                 send_row = st.session_state.table.loc[preview_idx].copy()
-                send_method = st.session_state.get("send_method", "飞书邮箱 CLI（已授权）")
 
                 with st.spinner("正在发送..."):
                     try:
-                        if send_method == "SMTP":
-                            if not smtp_host or not smtp_user or not smtp_password:
-                                st.error("SMTP 配置不完整，请在左侧配置后重试")
-                            else:
-                                smtp_send(
-                                    send_row,
-                                    smtp_host,
-                                    smtp_port,
-                                    smtp_user,
-                                    smtp_password,
-                                    sender_name or smtp_user,
-                                )
-                                st.session_state.table.at[preview_idx, STATUS_COL] = "已发送"
-                                st.session_state.table.at[preview_idx, SENT_AT_COL] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                                st.success(f"✅ 已通过 SMTP 发送至 {preview_email}")
-                        else:
-                            success, error_msg, msg_id = send_via_feishu_cli(send_row, html_body=preview_body_html)
-                            if not success:
-                                raise RuntimeError(error_msg)
-                            st.session_state.table.at[preview_idx, STATUS_COL] = "已发送"
-                            st.session_state.table.at[preview_idx, SENT_AT_COL] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                            st.session_state.table.at[preview_idx, MESSAGE_ID_COL] = msg_id
-                            st.success(f"✅ 已通过飞书邮箱发送至 {preview_email}")
-
-                        # 关闭预览
+                        smtp_send(
+                            send_row,
+                            smtp_host,
+                            smtp_port,
+                            smtp_user,
+                            smtp_password,
+                            sender_name or smtp_user,
+                            html_body=preview_body_html,
+                            use_ssl=use_ssl,
+                        )
+                        st.session_state.table.at[preview_idx, STATUS_COL] = "已发送"
+                        st.session_state.table.at[preview_idx, ERROR_COL] = ""
+                        st.session_state.table.at[preview_idx, SENT_AT_COL] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        st.success(f"已通过 SMTP 发送至 {preview_email}")
                         del st.session_state.preview_index
                         st.rerun()
-
-                    except Exception as e:
-                        st.session_state.table.at[preview_idx, ERROR_COL] = str(e)
-                        st.error(f"发送失败：{e}")
+                    except Exception as exc:
+                        error_message = str(exc)
+                        st.session_state.table.at[preview_idx, ERROR_COL] = error_message
+                        st.error(f"发送失败：{error_message}")
 
     with col_close:
         if st.button("❌ 关闭预览", key=f"close_{preview_idx}"):
